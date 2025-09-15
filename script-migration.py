@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Script de Migração: PostgreSQL para MariaDB
+Script de Migração: PostgreSQL para MariaDB - Versão 2 (Corrigida)
 Companies → Queues | Tickets → Tickets | Messages → Messages
 
 Autor: Sistema de Migração
 Data: 2025-09-15
+Versão: 2.0 - Corrigido problema de cores duplicadas
 """
 
 import psycopg2
 import mysql.connector
 import json
 import logging
+import hashlib
 from datetime import datetime
 import sys
 import traceback
@@ -75,6 +77,36 @@ class DatabaseMigration:
         if self.mysql_conn:
             self.mysql_conn.close()
             logger.info("🔌 Desconectado do MariaDB")
+    
+    def generate_unique_color(self, company_id, company_name):
+        """Gera uma cor única baseada no ID e nome da company"""
+        # Criar hash único baseado no ID e nome
+        unique_string = f"company_{company_id}_{company_name}_{company_id * 7}"
+        color_hash = hashlib.md5(unique_string.encode()).hexdigest()
+        
+        # Extrair 6 caracteres hex para formar a cor
+        color = f"#{color_hash[:6].upper()}"
+        
+        # Verificar se a cor já existe no banco
+        cursor = self.mysql_conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM Queues WHERE color = %s", (color,))
+        exists = cursor.fetchone()[0] > 0
+        cursor.close()
+        
+        # Se a cor já existe, modificar ligeiramente
+        attempt = 0
+        while exists and attempt < 100:
+            attempt += 1
+            modified_string = f"company_{company_id}_{company_name}_{company_id * 7}_{attempt}"
+            color_hash = hashlib.md5(modified_string.encode()).hexdigest()
+            color = f"#{color_hash[:6].upper()}"
+            
+            cursor = self.mysql_conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM Queues WHERE color = %s", (color,))
+            exists = cursor.fetchone()[0] > 0
+            cursor.close()
+        
+        return color
     
     def backup_existing_data(self):
         """Faz backup dos dados existentes no MariaDB para rollback"""
@@ -167,16 +199,14 @@ class DatabaseMigration:
             # Inserir como filas no MariaDB
             mysql_cursor = self.mysql_conn.cursor()
             
-            colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F', '#BB8FCE', '#A8E6CF']
-            
-            for i, company in enumerate(companies):
+            for company in companies:
                 company_id, name, created_at, updated_at, schedules = company
                 
                 # Converter schedules JSONB para texto
                 schedules_text = json.dumps(schedules) if schedules else '[]'
                 
-                # Escolher cor baseada no índice
-                color = colors[i % len(colors)]
+                # Gerar cor única para esta company
+                color = self.generate_unique_color(company_id, name)
                 
                 mysql_cursor.execute('''
                     INSERT INTO Queues (id, name, color, greetingMessage, createdAt, updatedAt, schedules, outOfHoursMessage)
@@ -192,7 +222,7 @@ class DatabaseMigration:
                     "Estamos fora do horário de atendimento. Deixe sua mensagem que retornaremos em breve."
                 ))
                 
-                logger.info(f"✅ Company '{name}' → Queue ID {company_id}")
+                logger.info(f"✅ Company '{name}' → Queue ID {company_id} (cor: {color})")
             
             pg_cursor.close()
             mysql_cursor.close()
@@ -313,26 +343,35 @@ class DatabaseMigration:
             
             mysql_cursor = self.mysql_conn.cursor()
             
-            for ticket in tickets:
-                ticket_id, status, last_message, contact_id, user_id, created_at, updated_at, whatsapp_id, is_group, unread_messages, company_id = ticket
+            batch_size = 1000
+            total_batches = (len(tickets) + batch_size - 1) // batch_size
+            
+            for i in range(0, len(tickets), batch_size):
+                batch = tickets[i:i + batch_size]
+                batch_num = (i // batch_size) + 1
                 
-                # A company_id vira a queueId no MariaDB
-                mysql_cursor.execute('''
-                    INSERT INTO Tickets (id, status, lastMessage, contactId, userId, createdAt, updatedAt, whatsappId, isGroup, unreadMessages, queueId)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ''', (
-                    ticket_id,
-                    status,
-                    last_message,
-                    contact_id,
-                    user_id,
-                    created_at,
-                    updated_at,
-                    whatsapp_id,
-                    is_group,
-                    unread_messages,
-                    company_id  # company_id vira queueId
-                ))
+                logger.info(f"📦 Processando batch {batch_num}/{total_batches} de tickets ({len(batch)} registros)")
+                
+                for ticket in batch:
+                    ticket_id, status, last_message, contact_id, user_id, created_at, updated_at, whatsapp_id, is_group, unread_messages, company_id = ticket
+                    
+                    # A company_id vira a queueId no MariaDB
+                    mysql_cursor.execute('''
+                        INSERT INTO Tickets (id, status, lastMessage, contactId, userId, createdAt, updatedAt, whatsappId, isGroup, unreadMessages, queueId)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ''', (
+                        ticket_id,
+                        status,
+                        last_message,
+                        contact_id,
+                        user_id,
+                        created_at,
+                        updated_at,
+                        whatsapp_id,
+                        is_group,
+                        unread_messages,
+                        company_id  # company_id vira queueId
+                    ))
             
             pg_cursor.close()
             mysql_cursor.close()
@@ -364,14 +403,14 @@ class DatabaseMigration:
             
             mysql_cursor = self.mysql_conn.cursor()
             
-            batch_size = 1000
+            batch_size = 2000  # Aumentado para melhor performance
             total_batches = (len(messages) + batch_size - 1) // batch_size
             
             for i in range(0, len(messages), batch_size):
                 batch = messages[i:i + batch_size]
                 batch_num = (i // batch_size) + 1
                 
-                logger.info(f"📦 Processando batch {batch_num}/{total_batches} ({len(batch)} messages)")
+                logger.info(f"📦 Processando batch {batch_num}/{total_batches} de messages ({len(batch)} registros)")
                 
                 for message in batch:
                     msg_id, body, ack, read, media_type, media_url, ticket_id, created_at, updated_at, from_me, is_deleted, contact_id, quoted_msg_id = message
@@ -394,6 +433,9 @@ class DatabaseMigration:
                         contact_id,
                         quoted_msg_id
                     ))
+                
+                # Commit em lotes para melhor performance
+                self.mysql_conn.commit()
             
             pg_cursor.close()
             mysql_cursor.close()
@@ -425,6 +467,12 @@ class DatabaseMigration:
             ''')
             pg_messages = pg_cursor.fetchone()[0]
             
+            pg_cursor.execute('SELECT COUNT(*) FROM "Contacts" WHERE "companyId" IS NOT NULL')
+            pg_contacts = pg_cursor.fetchone()[0]
+            
+            pg_cursor.execute('SELECT COUNT(*) FROM "Users" WHERE "companyId" IS NOT NULL')
+            pg_users = pg_cursor.fetchone()[0]
+            
             # Contar registros no MariaDB
             mysql_cursor = self.mysql_conn.cursor()
             
@@ -437,9 +485,17 @@ class DatabaseMigration:
             mysql_cursor.execute('SELECT COUNT(*) FROM Messages')
             mysql_messages = mysql_cursor.fetchone()[0]
             
+            mysql_cursor.execute('SELECT COUNT(*) FROM Contacts')
+            mysql_contacts = mysql_cursor.fetchone()[0]
+            
+            mysql_cursor.execute('SELECT COUNT(*) FROM Users')
+            mysql_users = mysql_cursor.fetchone()[0]
+            
             # Validar contadores
             logger.info("📊 VALIDAÇÃO DE MIGRAÇÃO:")
             logger.info(f"   Companies → Queues: {pg_companies} → {mysql_queues} {'✅' if pg_companies == mysql_queues else '❌'}")
+            logger.info(f"   Contacts: {pg_contacts} → {mysql_contacts} {'✅' if pg_contacts == mysql_contacts else '❌'}")
+            logger.info(f"   Users: {pg_users} → {mysql_users} {'✅' if pg_users == mysql_users else '❌'}")
             logger.info(f"   Tickets: {pg_tickets} → {mysql_tickets} {'✅' if pg_tickets == mysql_tickets else '❌'}")
             logger.info(f"   Messages: {pg_messages} → {mysql_messages} {'✅' if pg_messages == mysql_messages else '❌'}")
             
@@ -458,8 +514,22 @@ class DatabaseMigration:
             ''')
             orphaned_messages = mysql_cursor.fetchone()[0]
             
+            mysql_cursor.execute('''
+                SELECT COUNT(*) FROM Messages m 
+                LEFT JOIN Contacts c ON m.contactId = c.id 
+                WHERE m.contactId IS NOT NULL AND c.id IS NULL
+            ''')
+            orphaned_msg_contacts = mysql_cursor.fetchone()[0]
+            
             logger.info(f"   Tickets órfãos (sem queue): {orphaned_tickets} {'✅' if orphaned_tickets == 0 else '❌'}")
             logger.info(f"   Messages órfãs (sem ticket): {orphaned_messages} {'✅' if orphaned_messages == 0 else '❌'}")
+            logger.info(f"   Messages órfãs (sem contact): {orphaned_msg_contacts} {'✅' if orphaned_msg_contacts == 0 else '❌'}")
+            
+            # Verificar cores únicas
+            mysql_cursor.execute('SELECT COUNT(DISTINCT color) FROM Queues')
+            unique_colors = mysql_cursor.fetchone()[0]
+            
+            logger.info(f"   Cores únicas nas Queues: {unique_colors}/{mysql_queues} {'✅' if unique_colors == mysql_queues else '❌'}")
             
             pg_cursor.close()
             mysql_cursor.close()
@@ -467,10 +537,14 @@ class DatabaseMigration:
             # Retornar se validação passou
             validation_passed = (
                 pg_companies == mysql_queues and
+                pg_contacts == mysql_contacts and
+                pg_users == mysql_users and
                 pg_tickets == mysql_tickets and
                 pg_messages == mysql_messages and
                 orphaned_tickets == 0 and
-                orphaned_messages == 0
+                orphaned_messages == 0 and
+                orphaned_msg_contacts == 0 and
+                unique_colors == mysql_queues
             )
             
             return validation_passed
@@ -521,9 +595,21 @@ class DatabaseMigration:
                 logger.info(f"📦 Restaurou {len(self.backup_data['tickets'])} Tickets")
             
             if self.backup_data.get('messages'):
-                for message in self.backup_data['messages']:
-                    placeholders = ', '.join(['%s'] * len(message))
-                    cursor.execute(f"INSERT INTO Messages VALUES ({placeholders})", message)
+                batch_size = 1000
+                messages = self.backup_data['messages']
+                total_batches = (len(messages) + batch_size - 1) // batch_size
+                
+                for i in range(0, len(messages), batch_size):
+                    batch = messages[i:i + batch_size]
+                    batch_num = (i // batch_size) + 1
+                    
+                    for message in batch:
+                        placeholders = ', '.join(['%s'] * len(message))
+                        cursor.execute(f"INSERT INTO Messages VALUES ({placeholders})", message)
+                    
+                    if batch_num % 5 == 0:  # Log a cada 5 batches
+                        logger.info(f"📦 Restaurando Messages: batch {batch_num}/{total_batches}")
+                
                 logger.info(f"📦 Restaurou {len(self.backup_data['messages'])} Messages")
             
             # Reabilitar foreign key checks
@@ -540,7 +626,7 @@ class DatabaseMigration:
     def run_migration(self, dry_run=False):
         """Executa a migração completa"""
         try:
-            logger.info("🚀 Iniciando migração PostgreSQL → MariaDB")
+            logger.info("🚀 Iniciando migração PostgreSQL → MariaDB (v2.0)")
             
             if dry_run:
                 logger.info("🔍 MODO DRY RUN - Apenas validação, sem modificar dados")
@@ -569,8 +655,10 @@ class DatabaseMigration:
                     # Commit das transações
                     self.mysql_conn.commit()
                     logger.info("✅ MIGRAÇÃO CONCLUÍDA COM SUCESSO!")
+                    return True
                 else:
                     logger.error("❌ Validação falhou - Executando rollback")
+                    self.mysql_conn.rollback()
                     self.rollback_migration()
                     return False
             else:
@@ -590,8 +678,16 @@ class DatabaseMigration:
                 ''')
                 messages_count = pg_cursor.fetchone()[0]
                 
-                logger.info("📊 ESTATÍSTICAS DE MIGRAÇÃO (DRY RUN):")
+                pg_cursor.execute('SELECT COUNT(*) FROM "Contacts" WHERE "companyId" IS NOT NULL')
+                contacts_count = pg_cursor.fetchone()[0]
+                
+                pg_cursor.execute('SELECT COUNT(*) FROM "Users" WHERE "companyId" IS NOT NULL')
+                users_count = pg_cursor.fetchone()[0]
+                
+                logger.info("📊 ESTATÍSTICAS DE MIGRAÇÃO (DRY RUN v2.0):")
                 logger.info(f"   Companies → Queues: {companies_count}")
+                logger.info(f"   Contacts: {contacts_count}")
+                logger.info(f"   Users: {users_count}")
                 logger.info(f"   Tickets: {tickets_count}")
                 logger.info(f"   Messages: {messages_count}")
                 
@@ -605,6 +701,7 @@ class DatabaseMigration:
             
             if not dry_run and self.mysql_conn:
                 logger.warning("⏪ Executando rollback devido ao erro...")
+                self.mysql_conn.rollback()
                 self.rollback_migration()
             
             return False
@@ -615,8 +712,9 @@ class DatabaseMigration:
 def main():
     """Função principal"""
     print("=" * 60)
-    print("🔄 SCRIPT DE MIGRAÇÃO PostgreSQL → MariaDB")
+    print("🔄 SCRIPT DE MIGRAÇÃO PostgreSQL → MariaDB v2.0")
     print("   Companies → Queues | Tickets + Messages")
+    print("   🔧 CORRIGIDO: Cores únicas para cada fila")
     print("=" * 60)
     
     # Perguntar se quer executar em modo dry run
@@ -644,6 +742,13 @@ def main():
             if choice in ['s', 'sim', 'y', 'yes']:
                 migration_real = DatabaseMigration()
                 success_real = migration_real.run_migration(dry_run=False)
+                if success_real:
+                    print("\n🎉 MIGRAÇÃO CONCLUÍDA COM SUCESSO!")
+                    print("📋 Dados migrados:")
+                    print("   - Companies transformadas em Queues")
+                    print("   - Tickets associados às filas corretas")
+                    print("   - Messages com histórico completo")
+                    print("   - Cores únicas para cada fila")
                 break
             elif choice in ['n', 'não', 'no', 'nao']:
                 print("⏹️  Migração cancelada pelo usuário.")
