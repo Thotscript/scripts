@@ -234,16 +234,17 @@ class DatabaseMigration:
             raise
     
     def migrate_contacts(self):
-        """Migra Contacts do PostgreSQL para MariaDB"""
+        """Migra Contacts do PostgreSQL para MariaDB, tratando números duplicados"""
         logger.info("👥 Migrando Contacts...")
         
         try:
             pg_cursor = self.pg_conn.cursor()
             pg_cursor.execute('''
-                SELECT id, name, number, "profilePicUrl", "createdAt", "updatedAt", email, "isGroup"
-                FROM "Contacts"
-                WHERE "companyId" IS NOT NULL
-                ORDER BY id
+                SELECT c.id, c.name, c.number, c."profilePicUrl", c."createdAt", c."updatedAt", 
+                       c.email, c."isGroup", c."companyId"
+                FROM "Contacts" c
+                WHERE c."companyId" IS NOT NULL
+                ORDER BY c.id
             ''')
             contacts = pg_cursor.fetchall()
             
@@ -251,8 +252,28 @@ class DatabaseMigration:
             
             mysql_cursor = self.mysql_conn.cursor()
             
+            # Rastrear números já inseridos para evitar duplicatas
+            inserted_numbers = set()
+            duplicates_handled = 0
+            
             for contact in contacts:
-                contact_id, name, number, profile_pic, created_at, updated_at, email, is_group = contact
+                contact_id, name, number, profile_pic, created_at, updated_at, email, is_group, company_id = contact
+                
+                original_number = number
+                
+                # Se o número já foi inserido, modificar para torná-lo único
+                if number in inserted_numbers:
+                    # Adicionar sufixo baseado no company_id para tornar único
+                    number = f"{original_number}_c{company_id}"
+                    duplicates_handled += 1
+                    
+                    # Se ainda assim conflitar, adicionar timestamp
+                    attempt = 1
+                    while number in inserted_numbers and attempt < 100:
+                        number = f"{original_number}_c{company_id}_{attempt}"
+                        attempt += 1
+                    
+                    logger.info(f"📱 Número duplicado encontrado: {original_number} → {number} (contact_id: {contact_id})")
                 
                 mysql_cursor.execute('''
                     INSERT INTO Contacts (id, name, number, profilePicUrl, createdAt, updatedAt, email, isGroup)
@@ -267,11 +288,16 @@ class DatabaseMigration:
                     email or '',
                     is_group
                 ))
+                
+                # Adicionar à lista de números inseridos
+                inserted_numbers.add(number)
             
             pg_cursor.close()
             mysql_cursor.close()
             
             logger.info(f"✅ Migração Contacts concluída: {len(contacts)} registros")
+            if duplicates_handled > 0:
+                logger.info(f"📱 Números duplicados tratados: {duplicates_handled}")
             
         except Exception as e:
             logger.error(f"❌ Erro na migração Contacts: {e}")
