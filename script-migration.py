@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Script de Migração: PostgreSQL para MariaDB - Versão 3 (Corrigida)
+Script de Migração: PostgreSQL para MariaDB - Versão 4 (Corrigida)
 Companies → Queues | Tickets → Tickets | Messages → Messages
 
 Autor: Sistema de Migração
 Data: 2025-09-15
-Versão: 3.0 - Corrigido problema de números duplicados nos contatos
+Versão: 4.0 - Corrigido problema de Foreign Key com Whatsapps
 """
 
 import psycopg2
@@ -395,6 +395,69 @@ class DatabaseMigration:
             logger.error(f"❌ Erro na migração Users: {e}")
             raise
     
+    def migrate_whatsapps(self):
+        """Migra Whatsapps do PostgreSQL para MariaDB (apenas os necessários)"""
+        logger.info("📱 Migrando Whatsapps necessários...")
+        
+        try:
+            # Buscar whatsapps únicos que são referenciados pelos tickets
+            pg_cursor = self.pg_conn.cursor()
+            pg_cursor.execute('''
+                SELECT DISTINCT w.id, w.name, w."createdAt", w."updatedAt", w."isDefault", 
+                       w.retries, w."greetingMessage", w."farewellMessage"
+                FROM "Whatsapps" w
+                INNER JOIN "Tickets" t ON t."whatsappId" = w.id
+                WHERE t."companyId" IS NOT NULL
+                ORDER BY w.id
+            ''')
+            whatsapps = pg_cursor.fetchall()
+            
+            logger.info(f"📊 Encontrados {len(whatsapps)} whatsapps para migrar")
+            
+            if len(whatsapps) == 0:
+                logger.info("✅ Nenhum whatsapp necessário para migrar")
+                return
+            
+            mysql_cursor = self.mysql_conn.cursor()
+            
+            for whatsapp in whatsapps:
+                whatsapp_id, name, created_at, updated_at, is_default, retries, greeting_msg, farewell_msg = whatsapp
+                
+                # Verificar se já existe
+                mysql_cursor.execute("SELECT COUNT(*) FROM Whatsapps WHERE id = %s", (whatsapp_id,))
+                exists = mysql_cursor.fetchone()[0] > 0
+                
+                if not exists:
+                    mysql_cursor.execute('''
+                        INSERT INTO Whatsapps (id, name, createdAt, updatedAt, isDefault, retries, greetingMessage, farewellMessage, status, battery, plugged)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ''', (
+                        whatsapp_id,
+                        name,
+                        created_at,
+                        updated_at,
+                        is_default,
+                        retries,
+                        greeting_msg,
+                        farewell_msg,
+                        'DISCONNECTED',  # status padrão
+                        '0%',  # battery padrão
+                        False  # plugged padrão
+                    ))
+                    
+                    logger.info(f"✅ Whatsapp '{name}' → ID {whatsapp_id}")
+                else:
+                    logger.info(f"⚠️ Whatsapp ID {whatsapp_id} já existe - ignorando")
+            
+            pg_cursor.close()
+            mysql_cursor.close()
+            
+            logger.info(f"✅ Migração Whatsapps concluída: {len(whatsapps)} registros")
+            
+        except Exception as e:
+            logger.error(f"❌ Erro na migração Whatsapps: {e}")
+            raise
+    
     def migrate_tickets(self):
         """Migra Tickets do PostgreSQL para MariaDB, associando à fila correta"""
         logger.info("🎫 Migrando Tickets...")
@@ -417,6 +480,7 @@ class DatabaseMigration:
             
             batch_size = 1000
             total_batches = (len(tickets) + batch_size - 1) // batch_size
+            tickets_without_whatsapp = 0
             
             for i in range(0, len(tickets), batch_size):
                 batch = tickets[i:i + batch_size]
@@ -426,6 +490,16 @@ class DatabaseMigration:
                 
                 for ticket in batch:
                     ticket_id, status, last_message, contact_id, user_id, created_at, updated_at, whatsapp_id, is_group, unread_messages, company_id = ticket
+                    
+                    # Verificar se whatsappId existe na tabela Whatsapps do MariaDB
+                    final_whatsapp_id = whatsapp_id
+                    if whatsapp_id is not None:
+                        mysql_cursor.execute("SELECT COUNT(*) FROM Whatsapps WHERE id = %s", (whatsapp_id,))
+                        whatsapp_exists = mysql_cursor.fetchone()[0] > 0
+                        
+                        if not whatsapp_exists:
+                            final_whatsapp_id = None
+                            tickets_without_whatsapp += 1
                     
                     # A company_id vira a queueId no MariaDB
                     mysql_cursor.execute('''
@@ -439,7 +513,7 @@ class DatabaseMigration:
                         user_id,
                         created_at,
                         updated_at,
-                        whatsapp_id,
+                        final_whatsapp_id,  # NULL se whatsapp não existir
                         is_group,
                         unread_messages,
                         company_id  # company_id vira queueId
@@ -453,6 +527,8 @@ class DatabaseMigration:
             mysql_cursor.close()
             
             logger.info(f"✅ Migração Tickets concluída: {len(tickets)} registros")
+            if tickets_without_whatsapp > 0:
+                logger.info(f"⚠️  Tickets com whatsappId removido (whatsapp não existe): {tickets_without_whatsapp}")
             
         except Exception as e:
             logger.error(f"❌ Erro na migração Tickets: {e}")
@@ -710,7 +786,7 @@ class DatabaseMigration:
     def run_migration(self, dry_run=False):
         """Executa a migração completa"""
         try:
-            logger.info("🚀 Iniciando migração PostgreSQL → MariaDB (v3.0)")
+            logger.info("🚀 Iniciando migração PostgreSQL → MariaDB (v4.0)")
             
             if dry_run:
                 logger.info("🔍 MODO DRY RUN - Apenas validação, sem modificar dados")
@@ -725,10 +801,11 @@ class DatabaseMigration:
                 # Limpar tabelas de destino
                 self.clear_target_tables()
                 
-                # Executar migrações
+                # Executar migrações na ordem correta
                 self.migrate_companies_to_queues()
                 self.migrate_contacts()
                 self.migrate_users()
+                self.migrate_whatsapps()  # NOVO: migrar whatsapps antes dos tickets
                 self.migrate_tickets()
                 self.migrate_messages()
                 
@@ -812,9 +889,9 @@ class DatabaseMigration:
 def main():
     """Função principal"""
     print("=" * 70)
-    print("🔄 SCRIPT DE MIGRAÇÃO PostgreSQL → MariaDB v3.0")
+    print("🔄 SCRIPT DE MIGRAÇÃO PostgreSQL → MariaDB v4.0")
     print("   Companies → Queues | Tickets + Messages")
-    print("   🔧 CORRIGIDO: Cores únicas + Números duplicados")
+    print("   🔧 CORRIGIDO: Whatsapps + Foreign Keys")
     print("=" * 70)
     
     # Perguntar se quer executar em modo dry run
