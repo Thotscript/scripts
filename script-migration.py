@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Script de Migração: PostgreSQL para MariaDB - Versão 2 (Corrigida)
+Script de Migração: PostgreSQL para MariaDB - Versão 3 (Corrigida)
 Companies → Queues | Tickets → Tickets | Messages → Messages
 
 Autor: Sistema de Migração
 Data: 2025-09-15
-Versão: 2.0 - Corrigido problema de cores duplicadas
+Versão: 3.0 - Corrigido problema de números duplicados nos contatos
 """
 
 import psycopg2
@@ -256,41 +256,54 @@ class DatabaseMigration:
             inserted_numbers = set()
             duplicates_handled = 0
             
-            for contact in contacts:
-                contact_id, name, number, profile_pic, created_at, updated_at, email, is_group, company_id = contact
+            batch_size = 1000
+            total_batches = (len(contacts) + batch_size - 1) // batch_size
+            
+            for i in range(0, len(contacts), batch_size):
+                batch = contacts[i:i + batch_size]
+                batch_num = (i // batch_size) + 1
                 
-                original_number = number
+                logger.info(f"📦 Processando batch {batch_num}/{total_batches} de contacts ({len(batch)} registros)")
                 
-                # Se o número já foi inserido, modificar para torná-lo único
-                if number in inserted_numbers:
-                    # Adicionar sufixo baseado no company_id para tornar único
-                    number = f"{original_number}_c{company_id}"
-                    duplicates_handled += 1
+                for contact in batch:
+                    contact_id, name, number, profile_pic, created_at, updated_at, email, is_group, company_id = contact
                     
-                    # Se ainda assim conflitar, adicionar timestamp
-                    attempt = 1
-                    while number in inserted_numbers and attempt < 100:
-                        number = f"{original_number}_c{company_id}_{attempt}"
-                        attempt += 1
+                    original_number = number
                     
-                    logger.info(f"📱 Número duplicado encontrado: {original_number} → {number} (contact_id: {contact_id})")
+                    # Se o número já foi inserido, modificar para torná-lo único
+                    if number in inserted_numbers:
+                        # Adicionar sufixo baseado no company_id para tornar único
+                        number = f"{original_number}_c{company_id}"
+                        duplicates_handled += 1
+                        
+                        # Se ainda assim conflitar, adicionar contador
+                        attempt = 1
+                        while number in inserted_numbers and attempt < 100:
+                            number = f"{original_number}_c{company_id}_{attempt}"
+                            attempt += 1
+                        
+                        logger.info(f"📱 Número duplicado: {original_number} → {number} (contact_id: {contact_id})")
+                    
+                    mysql_cursor.execute('''
+                        INSERT INTO Contacts (id, name, number, profilePicUrl, createdAt, updatedAt, email, isGroup)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ''', (
+                        contact_id,
+                        name,
+                        number,
+                        profile_pic,
+                        created_at,
+                        updated_at,
+                        email or '',
+                        is_group
+                    ))
+                    
+                    # Adicionar à lista de números inseridos
+                    inserted_numbers.add(number)
                 
-                mysql_cursor.execute('''
-                    INSERT INTO Contacts (id, name, number, profilePicUrl, createdAt, updatedAt, email, isGroup)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ''', (
-                    contact_id,
-                    name,
-                    number,
-                    profile_pic,
-                    created_at,
-                    updated_at,
-                    email or '',
-                    is_group
-                ))
-                
-                # Adicionar à lista de números inseridos
-                inserted_numbers.add(number)
+                # Commit em lotes para melhor performance
+                if batch_num % 5 == 0:  # Commit a cada 5 batches
+                    self.mysql_conn.commit()
             
             pg_cursor.close()
             mysql_cursor.close()
@@ -321,8 +334,36 @@ class DatabaseMigration:
             
             mysql_cursor = self.mysql_conn.cursor()
             
+            # Rastrear emails já inseridos para evitar duplicatas
+            inserted_emails = set()
+            duplicates_handled = 0
+            
             for user in users:
                 user_id, name, email, password_hash, created_at, updated_at, profile, token_version, online = user
+                
+                original_email = email
+                
+                # Se o email já foi inserido, modificar para torná-lo único
+                if email in inserted_emails:
+                    # Adicionar sufixo baseado no user_id para tornar único
+                    email_parts = original_email.split('@')
+                    if len(email_parts) == 2:
+                        email = f"{email_parts[0]}_u{user_id}@{email_parts[1]}"
+                    else:
+                        email = f"{original_email}_u{user_id}"
+                    
+                    duplicates_handled += 1
+                    
+                    # Se ainda assim conflitar, adicionar contador
+                    attempt = 1
+                    while email in inserted_emails and attempt < 100:
+                        if len(email_parts) == 2:
+                            email = f"{email_parts[0]}_u{user_id}_{attempt}@{email_parts[1]}"
+                        else:
+                            email = f"{original_email}_u{user_id}_{attempt}"
+                        attempt += 1
+                    
+                    logger.info(f"📧 Email duplicado: {original_email} → {email} (user_id: {user_id})")
                 
                 mysql_cursor.execute('''
                     INSERT INTO Users (id, name, email, passwordHash, createdAt, updatedAt, profile, tokenVersion, whatsappId, online)
@@ -339,11 +380,16 @@ class DatabaseMigration:
                     None,  # whatsappId será nulo inicialmente
                     online
                 ))
+                
+                # Adicionar à lista de emails inseridos
+                inserted_emails.add(email)
             
             pg_cursor.close()
             mysql_cursor.close()
             
             logger.info(f"✅ Migração Users concluída: {len(users)} registros")
+            if duplicates_handled > 0:
+                logger.info(f"📧 Emails duplicados tratados: {duplicates_handled}")
             
         except Exception as e:
             logger.error(f"❌ Erro na migração Users: {e}")
@@ -398,6 +444,10 @@ class DatabaseMigration:
                         unread_messages,
                         company_id  # company_id vira queueId
                     ))
+                
+                # Commit em lotes para melhor performance
+                if batch_num % 5 == 0:  # Commit a cada 5 batches
+                    self.mysql_conn.commit()
             
             pg_cursor.close()
             mysql_cursor.close()
@@ -461,7 +511,8 @@ class DatabaseMigration:
                     ))
                 
                 # Commit em lotes para melhor performance
-                self.mysql_conn.commit()
+                if batch_num % 3 == 0:  # Commit a cada 3 batches
+                    self.mysql_conn.commit()
             
             pg_cursor.close()
             mysql_cursor.close()
@@ -557,6 +608,12 @@ class DatabaseMigration:
             
             logger.info(f"   Cores únicas nas Queues: {unique_colors}/{mysql_queues} {'✅' if unique_colors == mysql_queues else '❌'}")
             
+            # Verificar números únicos
+            mysql_cursor.execute('SELECT COUNT(DISTINCT number) FROM Contacts')
+            unique_numbers = mysql_cursor.fetchone()[0]
+            
+            logger.info(f"   Números únicos nos Contacts: {unique_numbers}/{mysql_contacts} {'✅' if unique_numbers == mysql_contacts else '❌'}")
+            
             pg_cursor.close()
             mysql_cursor.close()
             
@@ -570,7 +627,8 @@ class DatabaseMigration:
                 orphaned_tickets == 0 and
                 orphaned_messages == 0 and
                 orphaned_msg_contacts == 0 and
-                unique_colors == mysql_queues
+                unique_colors == mysql_queues and
+                unique_numbers == mysql_contacts
             )
             
             return validation_passed
@@ -652,7 +710,7 @@ class DatabaseMigration:
     def run_migration(self, dry_run=False):
         """Executa a migração completa"""
         try:
-            logger.info("🚀 Iniciando migração PostgreSQL → MariaDB (v2.0)")
+            logger.info("🚀 Iniciando migração PostgreSQL → MariaDB (v3.0)")
             
             if dry_run:
                 logger.info("🔍 MODO DRY RUN - Apenas validação, sem modificar dados")
@@ -678,7 +736,7 @@ class DatabaseMigration:
                 validation_passed = self.validate_migration()
                 
                 if validation_passed:
-                    # Commit das transações
+                    # Commit final das transações
                     self.mysql_conn.commit()
                     logger.info("✅ MIGRAÇÃO CONCLUÍDA COM SUCESSO!")
                     return True
@@ -710,12 +768,28 @@ class DatabaseMigration:
                 pg_cursor.execute('SELECT COUNT(*) FROM "Users" WHERE "companyId" IS NOT NULL')
                 users_count = pg_cursor.fetchone()[0]
                 
-                logger.info("📊 ESTATÍSTICAS DE MIGRAÇÃO (DRY RUN v2.0):")
+                logger.info("📊 ESTATÍSTICAS DE MIGRAÇÃO (DRY RUN v3.0):")
                 logger.info(f"   Companies → Queues: {companies_count}")
                 logger.info(f"   Contacts: {contacts_count}")
                 logger.info(f"   Users: {users_count}")
                 logger.info(f"   Tickets: {tickets_count}")
                 logger.info(f"   Messages: {messages_count}")
+                
+                # Verificar duplicatas potenciais
+                pg_cursor.execute('''
+                    SELECT COUNT(*) - COUNT(DISTINCT number) as duplicates
+                    FROM "Contacts" WHERE "companyId" IS NOT NULL
+                ''')
+                contact_duplicates = pg_cursor.fetchone()[0]
+                
+                pg_cursor.execute('''
+                    SELECT COUNT(*) - COUNT(DISTINCT email) as duplicates  
+                    FROM "Users" WHERE "companyId" IS NOT NULL
+                ''')
+                user_duplicates = pg_cursor.fetchone()[0]
+                
+                logger.info(f"   Números duplicados detectados: {contact_duplicates}")
+                logger.info(f"   Emails duplicados detectados: {user_duplicates}")
                 
                 pg_cursor.close()
             
@@ -737,11 +811,11 @@ class DatabaseMigration:
 
 def main():
     """Função principal"""
-    print("=" * 60)
-    print("🔄 SCRIPT DE MIGRAÇÃO PostgreSQL → MariaDB v2.0")
+    print("=" * 70)
+    print("🔄 SCRIPT DE MIGRAÇÃO PostgreSQL → MariaDB v3.0")
     print("   Companies → Queues | Tickets + Messages")
-    print("   🔧 CORRIGIDO: Cores únicas para cada fila")
-    print("=" * 60)
+    print("   🔧 CORRIGIDO: Cores únicas + Números duplicados")
+    print("=" * 70)
     
     # Perguntar se quer executar em modo dry run
     while True:
@@ -760,7 +834,7 @@ def main():
     success = migration.run_migration(dry_run=dry_run)
     
     if dry_run and success:
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 70)
         print("✅ DRY RUN concluído com sucesso!")
         
         while True:
@@ -771,10 +845,11 @@ def main():
                 if success_real:
                     print("\n🎉 MIGRAÇÃO CONCLUÍDA COM SUCESSO!")
                     print("📋 Dados migrados:")
-                    print("   - Companies transformadas em Queues")
+                    print("   - Companies transformadas em Queues com cores únicas")
+                    print("   - Contacts com números duplicados tratados")
+                    print("   - Users com emails duplicados tratados")
                     print("   - Tickets associados às filas corretas")
                     print("   - Messages com histórico completo")
-                    print("   - Cores únicas para cada fila")
                 break
             elif choice in ['n', 'não', 'no', 'nao']:
                 print("⏹️  Migração cancelada pelo usuário.")
@@ -782,13 +857,13 @@ def main():
             else:
                 print("❌ Resposta inválida. Digite 's' para sim ou 'n' para não.")
     
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     if success:
         print("✅ PROCESSO CONCLUÍDO!")
     else:
         print("❌ PROCESSO FALHOU!")
     print("📋 Verifique o arquivo 'migration.log' para detalhes completos.")
-    print("=" * 60)
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()
